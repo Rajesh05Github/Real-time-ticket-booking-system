@@ -1,0 +1,113 @@
+@import 'tailwindcss';
+/* Explicit source root, not Tailwind v4's auto-detection -- v4's
+   walk-up-and-honor-.gitignore inference is unreliable inside a pnpm
+   monorepo, and there's a known Turbopack dev-server gap where a
+   freshly-used utility class doesn't appear until a restart (already-
+   seen classes keep working, which makes it a confusing one to diagnose
+   without this line). next build is unaffected either way. */
+@source '../**/*.{ts,tsx}';
+
+@theme {
+  /* Surfaces -- four steps so cards/panels/inputs can nest visibly on a
+     near-black canvas without ever needing a literal shadow to separate
+     them. */
+  --color-canvas: #07080b;
+  --color-surface: #0e1015;
+  --color-surface-2: #15181f;
+  --color-surface-3: #1c2029;
+  --color-border: #242935;
+  --color-border-strong: #333a49;
+
+  /* Text */
+  --color-fg: #e8eaf0;
+  --color-fg-muted: #9aa3b5;
+  --color-fg-subtle: #6b7385;
+
+  /* Brand: indigo -> violet. Reserved for the ONE primary action per
+     screen and for "this is selected/mine" -- never used decoratively. */
+  --color-brand-300: #a5a0ff;
+  --color-brand-400: #8b83ff;
+  --color-brand-500: #6d5efc;
+  --color-brand-600: #5847e8;
+  --color-brand-ink: #0b0a1f;
+
+  /* Semantic */
+  --color-success: #34d399;
+  --color-warning: #fbbf24;
+  --color-danger: #fb7185;
+  --color-info: #38bdf8;
+
+  /* Seat-map semantics -- the one place color must be unambiguous at a
+     glance, since a customer is choosing money based on it. */
+  --color-seat-available: #202634;
+  --color-seat-available-ring: #38455e;
+  --color-seat-selected: #6d5efc;
+  --color-seat-reserved: #4a3a12;
+  --color-seat-reserved-fg: #fbbf24;
+  --color-seat-sold: #17191f;
+  --color-seat-sold-fg: #4b5563;
+
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 18px;
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', 'Cascadia Code', Consolas, monospace;
+
+  --shadow-glow: 0 0 0 1px rgb(109 94 252 / 0.35), 0 8px 32px -8px rgb(109 94 252 / 0.45);
+}
+
+:root {
+  color-scheme: dark;
+}
+
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+
+  html,
+  body {
+    margin: 0;
+    height: 100%;
+  }
+
+  body {
+    background: var(--color-canvas);
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+  }
+
+  /* Keyboard-navigable seat grid + forms mean focus visibility is
+     non-negotiable here, not a nice-to-have. */
+  :focus-visible {
+    outline: 2px solid var(--color-brand-400);
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background: var(--color-brand-500);
+    color: var(--color-brand-ink);
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: var(--color-canvas);
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-surface-3);
+    border-radius: 999px;
+    border: 2px solid var(--color-canvas);
+  }
+
+  /* tabular-nums everywhere numbers can change in place (prices, seat
+     codes, countdowns, ticket numbers) so a re-render never jitters the
+     layout by a fraction of a character width. */
+  .tnum {
+    font-variant-numeric: tabular-nums;
+  }
+}

@@ -1,0 +1,61 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# build output
+dist/
+build/
+out/
+.next/
+.turbo/
+*.tsbuildinfo
+
+# env - NEVER commit real secrets
+.env
+.env.*
+!.env.example
+
+# logs
+logs/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# test / coverage
+coverage/
+.nyc_output/
+test-results/
+playwright-report/
+
+# docker volumes (local data)
+infra/docker/volumes/
+
+# editor / os
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# k6 output
+tests/load/output/
+
+# terraform (Phase 21) - state and real variable values NEVER get
+# committed, same "real secrets never checked in" principle as .env
+# above; .terraform.lock.hcl is the one exception (Terraform itself
+# recommends committing it, for reproducible provider version selection)
+infra/terraform/.terraform/
+infra/terraform/*.tfstate
+infra/terraform/*.tfstate.*
+infra/terraform/terraform.tfvars
+infra/terraform/*.auto.tfvars
+!infra/terraform/terraform.tfvars.example
+
+# terraform (Azure) - same rules as infra/terraform above
+infra/azure/terraform/.terraform/
+infra/azure/terraform/*.tfstate
+infra/azure/terraform/*.tfstate.*
+infra/azure/terraform/terraform.tfvars
+infra/azure/terraform/*.auto.tfvars
+!infra/azure/terraform/terraform.tfvars.example

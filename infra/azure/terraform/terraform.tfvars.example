@@ -1,0 +1,22 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored.
+# See docs/azure-deployment.md for the full bootstrap order.
+
+subscription_id = "00000000-0000-0000-0000-000000000000"
+location        = "centralindia"
+environment     = "prod"
+
+# The tag you pushed with infra/azure/scripts/build-and-push.sh (e.g. the
+# git SHA). Only used when the apps are first created; CI deploys after that.
+image_tag = "replace-with-pushed-tag"
+
+# Optional: a hostname you will bind to the gateway (CNAME + TXT record).
+custom_domain = null
+
+postgres_sku               = "B_Standard_B2s"
+postgres_zone_redundant_ha = false
+redis_sku                  = "Balanced_B0"
+email_data_location        = "India"
+
+api_min_replicas = 1
+api_max_replicas = 4
+worker_replicas  = 1

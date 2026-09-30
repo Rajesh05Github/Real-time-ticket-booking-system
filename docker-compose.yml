@@ -1,0 +1,289 @@
+# Prod-shaped full stack: every service containerized behind Nginx.
+#
+# For DAY-TO-DAY local development, you don't need this whole stack --
+# run just the two stateful dependencies and use `pnpm dev` on the host
+# for api/worker/web (fast hot-reload via tsx watch / next dev):
+#
+#   docker compose up -d postgres redis
+#   pnpm dev
+#
+# Use the full `docker compose up --build` below when you want to verify
+# the actual Dockerfiles, health checks, inter-service networking, and
+# graceful shutdown under real container signal delivery -- this is also
+# the closest local approximation to the eventual AWS deployment shape
+# (section 60/61).
+#
+# IMPORTANT: DATABASE_URL/REDIS_URL below use container-network service
+# names (postgres, redis), NOT localhost. .env's copies of these vars use
+# `localhost` because that file is for HOST-run processes. The two are
+# deliberately different values for the same variable name -- see
+# docs/deployment.md for why reusing one `.env` for both would break.
+
+name: flashsale
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: flashsale
+      # Phase 20 hardening: NO fallback default here (contrast with how
+      # this line read through Phase 19 -- a plaintext password baked
+      # directly into this TRACKED file). `${POSTGRES_PASSWORD}` with no
+      # `:-default` means Compose fails loudly if `.env` doesn't supply
+      # one, instead of every clone of this repo silently starting with
+      # the exact same well-known, publicly-visible password. `.env`
+      # (gitignored, per-developer/per-environment) is the only place
+      # this value now lives locally; Phase 21's AWS deployment pulls the
+      # real production equivalent from a secrets manager (Secrets
+      # Manager / SSM Parameter Store) instead, never a `.env` file at
+      # all.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set -- see .env.example}
+      POSTGRES_DB: flashsale
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      # Host port 5450, not the standard 5432: this machine already runs
+      # several other unrelated Postgres CONTAINERS on 5432-5435 for
+      # other projects, AND (found live while building Phase 22's
+      # frontend, the hard way) a NATIVE Windows PostgreSQL Service
+      # (`postgres.exe`, running as a Windows Service, not in Docker at
+      # all) that happens to also be listening on 5436/5437 -- `netstat
+      # -ano` showed TWO listeners on the same port (Docker's own
+      # forwarding proxy AND the native service), and Windows silently
+      # routes some fraction of connections to whichever one the OS
+      # picks, producing an intermittent, maddening `P1000 password
+      # authentication failed` that has NOTHING to do with the actual
+      # password (confirmed correct via `docker exec`'s own psql, both
+      # over the unix socket and over TCP loopback INSIDE the container --
+      # only external connections through the contended host port ever
+      # failed). 5450 was confirmed via `tasklist` on the offending PID
+      # plus a direct `netstat -ano` single-listener check to be free of
+      # BOTH other Docker containers and any native Windows service, not
+      # just the previous "no other docker-compose project has grabbed
+      # this yet" check alone. Only the HOST-side port differs -- inside
+      # the Docker network every service still reaches Postgres at
+      # postgres:5432.
+      - '5450:5432'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U flashsale -d flashsale']
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - flashsale-net
+
+  redis:
+    image: redis:7-alpine
+    # --appendonly yes: enables AOF persistence. Without it, `docker
+    # compose restart redis` (or a host reboot) silently discards every
+    # session, lock, counter, and -- critically for Phase 11 -- every
+    # Redis Stream entry, which contradicts the "Streams are durable"
+    # story this project teaches. RDB snapshots alone are not enough: a
+    # snapshot only captures state at its last save point, so entries
+    # written between saves are still lost on an unclean restart.
+    # --maxmemory-policy noeviction: the default, stated explicitly. Redis
+    # must NEVER silently evict a key to free memory -- an evicted lock or
+    # session would violate the exact correctness assumptions sections 5
+    # and 21 depend on. Under real memory pressure this makes Redis start
+    # REJECTING writes instead of corrupting state, which is the correct
+    # failure mode: loud and visible, not silent and wrong.
+    command: redis-server --appendonly yes --maxmemory-policy noeviction
+    volumes:
+      - redis_data:/data
+    ports:
+      # Host port 6381, not 6379 or 6380: this machine runs other
+      # projects' Redis containers on both of those (6380 specifically
+      # drifted to a different project after this project picked it --
+      # same class of live port collision as the Postgres port above).
+      # Container-network access is unaffected -- other services here
+      # still reach it at redis:6379.
+      - '6381:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - flashsale-net
+
+  api:
+    build:
+      context: .
+      dockerfile: infra/docker/api.Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      # connection_limit=20: Phase 18's load test found Prisma's DEFAULT
+      # pool (num_cpus*2+1, unset here previously) was the real bottleneck
+      # behind elevated p95 latency under 150 concurrent VUs -- see
+      # docs/load-testing.md. 20 is still one process's budget out of
+      # Postgres's own max_connections (100 by default), leaving headroom
+      # for the worker's own pool (below) and any direct/admin
+      # connections -- not raised further without also raising
+      # max_connections or fronting Postgres with a pooler (PgBouncer),
+      # which is real, valid, and deliberately out of scope here (see
+      # docs/load-testing.md's own "what this phase doesn't include").
+      DATABASE_URL: postgresql://flashsale:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set -- see .env.example}@postgres:5432/flashsale?connection_limit=20
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: info
+      PORT: 4000
+      HOST: 0.0.0.0
+      CORS_ORIGIN: http://localhost:3000,http://localhost:8080,https://localhost:8443
+      # Phase 20: no fallback default (see POSTGRES_PASSWORD's comment
+      # above for why) -- `.env` is required to supply a real value.
+      COOKIE_SECRET: ${COOKIE_SECRET:?COOKIE_SECRET must be set -- see .env.example}
+      SHUTDOWN_TIMEOUT_MS: 10000
+      PAYMENT_WEBHOOK_SECRET: ${PAYMENT_WEBHOOK_SECRET:?PAYMENT_WEBHOOK_SECRET must be set -- see .env.example}
+    ports:
+      - '4000:4000' # direct access for debugging; Nginx is the intended entrypoint
+    healthcheck:
+      # 127.0.0.1, NOT localhost: Alpine's wget resolves `localhost` to
+      # `::1` first, but `HOST=0.0.0.0` above binds Node's server to
+      # IPv4 only. The healthcheck would otherwise fail with "connection
+      # refused" against a server that is actually up and healthy on
+      # IPv4 -- a real gotcha this stack hit on first boot, not a
+      # hypothetical one.
+      test: ['CMD', 'wget', '--no-verbose', '--tries=1', '--spider', 'http://127.0.0.1:4000/health']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - flashsale-net
+
+  worker:
+    build:
+      context: .
+      dockerfile: infra/docker/worker.Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      # connection_limit=10, smaller than api's 20 above: the worker's
+      # Prisma usage is a handful of periodic ticks (outbox publisher,
+      # reservation-expiry sweeper) plus BullMQ job processing, not
+      # request-path traffic scaling with concurrent HTTP connections --
+      # it never needed a pool sized for 150 concurrent callers the way
+      # api's did.
+      DATABASE_URL: postgresql://flashsale:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set -- see .env.example}@postgres:5432/flashsale?connection_limit=10
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: info
+      WORKER_CONCURRENCY: 5
+      SHUTDOWN_TIMEOUT_MS: 15000
+      # WORKER_PORT, not PORT -- see apps/worker/src/env.ts's comment on
+      # why these needed to be distinct variable NAMES, not just
+      # distinct values, once host-run dev started sharing one .env
+      # file between api and worker.
+      WORKER_PORT: 4100
+      # console by default so the local stack needs no email account;
+      # set EMAIL_PROVIDER=smtp (+ SMTP_*/EMAIL_FROM) in .env to send real
+      # mail from this stack -- see .env.example.
+      EMAIL_PROVIDER: ${EMAIL_PROVIDER:-console}
+      EMAIL_FROM: ${EMAIL_FROM:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+    healthcheck:
+      # Same IPv4-vs-IPv6 reasoning as the api service's healthcheck
+      # below (Alpine's wget resolves `localhost` to `::1` first, but
+      # health-server.ts binds to all interfaces on IPv4 by default).
+      test: ['CMD', 'wget', '--no-verbose', '--tries=1', '--spider', 'http://127.0.0.1:4100/health']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - flashsale-net
+
+  web:
+    build:
+      context: .
+      dockerfile: infra/docker/web.Dockerfile
+      args:
+        # See web.Dockerfile: this is a BUILD-time value baked into the
+        # client bundle, not a runtime env var -- it must point at
+        # wherever the BROWSER can reach the API, i.e. through Nginx,
+        # not at the container-network `api` hostname (which only
+        # other containers can resolve).
+        #
+        # ORIGIN ONLY -- no `/api` suffix and no path. apps/web's API
+        # client (src/lib/api/config.ts) is the one place that owns
+        # appending `/api/v1`, so this env var means the same thing here
+        # as it does in .env.example's host-run value
+        # (NEXT_PUBLIC_API_URL=http://localhost:4000) -- previously these
+        # two had DIFFERENT conventions (one bare origin, one with `/api`
+        # baked in), which is exactly the kind of inconsistency that
+        # silently breaks every API call the moment someone copies the
+        # "wrong" one. Also HTTPS, not the old `:8080` -- Phase 20's Nginx
+        # redirects everything except /health to HTTPS (docs/production
+        # -hardening.md), and a 301 on a POST is not something the auth
+        # flow can tolerate.
+        NEXT_PUBLIC_API_URL: https://localhost:8443
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - '3000:3000' # direct access for debugging; Nginx is the intended entrypoint
+    networks:
+      - flashsale-net
+
+  # Phase 20: a one-shot init container, not baked into `nginx`'s own
+  # entrypoint -- generating a cert needs `openssl`, which the stock
+  # `nginx:1.27-alpine` image doesn't include, and installing it into
+  # that image on every container start would be slower and messier than
+  # a dedicated tiny container that runs once and exits.
+  nginx-cert-init:
+    image: alpine:3.20
+    volumes:
+      - nginx_certs:/certs
+      - ./infra/nginx/generate-dev-cert.sh:/generate-dev-cert.sh:ro
+    command: sh -c "apk add --no-cache openssl >/dev/null && sh /generate-dev-cert.sh"
+    networks:
+      - flashsale-net
+
+  nginx:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - nginx_certs:/etc/nginx/certs:ro
+    ports:
+      # Host port 8080, not 80: Windows reserves port 80 at the OS level
+      # (HTTP.sys-backed system services hold it even with nothing
+      # user-visible running) on this machine. Nginx still listens on 80
+      # INSIDE the container -- only the host-side binding differs, same
+      # as the Postgres/Redis port remaps above. On a Linux deployment
+      # target this line reverts to '80:80'.
+      - '8080:80'
+      # Host port 8443 for the same Windows-port-reservation reason as
+      # 8080 above (443 -> 8443, not a Windows-specific issue this time,
+      # but kept consistent with the rest of this file's remapping
+      # pattern rather than binding some ports at their standard number
+      # and others remapped).
+      - '8443:443'
+    depends_on:
+      api:
+        condition: service_started
+      web:
+        condition: service_started
+      nginx-cert-init:
+        condition: service_completed_successfully
+    networks:
+      - flashsale-net
+
+networks:
+  flashsale-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  nginx_certs:

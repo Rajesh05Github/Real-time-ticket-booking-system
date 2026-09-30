@@ -1,0 +1,92 @@
+# Azure Container Apps gateway -- the one PUBLIC entry point. Does the
+# same two jobs infra/nginx/nginx.conf does locally (path routing: /api/*
+# -> api, everything else -> web), minus TLS: Container Apps' own ingress
+# terminates HTTPS with a managed certificate in front of this container.
+#
+# Rendered at container start by the official nginx image's
+# 20-envsubst-on-templates.sh: ${API_UPSTREAM_HOST}, ${WEB_UPSTREAM_HOST}
+# and ${NGINX_LOCAL_RESOLVERS} are substituted; every other $variable is
+# left for nginx itself (the image only substitutes variables that are
+# actually defined in the environment).
+
+# Real client IP. Requests arrive via the Container Apps edge proxy
+# (Envoy), which appends the TCP peer address to X-Forwarded-For. Trusting
+# only private/CGNAT source ranges and walking the header from the right
+# (real_ip_recursive) yields the first PUBLIC address -- the actual
+# client. Anything a client prepends itself sits to the left of that and
+# is ignored, so apps/api's per-IP rate limits can't be dodged by sending
+# a fake X-Forwarded-For.
+set_real_ip_from 10.0.0.0/8;
+set_real_ip_from 172.16.0.0/12;
+set_real_ip_from 192.168.0.0/16;
+set_real_ip_from 100.64.0.0/10;
+real_ip_header X-Forwarded-For;
+real_ip_recursive on;
+
+# Upstreams are resolved at REQUEST time (variables in proxy_pass +
+# resolver), not once at startup: the internal FQDNs of the api/web apps
+# may not resolve yet when this container first boots, and their IPs can
+# change as Container Apps moves replicas around.
+resolver ${NGINX_LOCAL_RESOLVERS} valid=10s ipv6=off;
+resolver_timeout 5s;
+
+map $http_upgrade $connection_upgrade {
+  default upgrade;
+  ''      close;
+}
+
+server {
+  listen 8080;
+  server_name _;
+
+  client_max_body_size 2m;
+  proxy_connect_timeout 5s;
+  proxy_send_timeout 10s;
+  proxy_read_timeout 10s;
+
+  gzip on;
+  gzip_types text/plain application/json application/javascript text/css;
+  gzip_min_length 1024;
+
+  set $api_host ${API_UPSTREAM_HOST};
+  set $web_host ${WEB_UPSTREAM_HOST};
+
+  # Container Apps routes internal traffic by Host header, so each
+  # upstream request carries the upstream's own internal FQDN. The
+  # client's original host and scheme travel in X-Forwarded-*. The client
+  # IP is OVERWRITTEN (not appended) with the value realip resolved above.
+  proxy_set_header Host $api_host;
+  proxy_set_header X-Forwarded-Host $host;
+  proxy_set_header X-Forwarded-Proto https;
+  proxy_set_header X-Forwarded-For $remote_addr;
+  proxy_set_header X-Real-IP $remote_addr;
+
+  # The gateway's own liveness probe -- deliberately not proxied, so a
+  # slow api never makes Container Apps restart the gateway.
+  location = /gateway-health {
+    access_log off;
+    return 200 'ok';
+  }
+
+  location = /health {
+    proxy_pass http://$api_host/health;
+  }
+
+  location ~ ^/api/v1/events/[^/]+/live$ {
+    proxy_pass http://$api_host;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+    proxy_read_timeout 1h;
+    proxy_send_timeout 1h;
+  }
+
+  location /api/ {
+    proxy_pass http://$api_host;
+  }
+
+  location / {
+    proxy_set_header Host $web_host;
+    proxy_pass http://$web_host;
+  }
+}

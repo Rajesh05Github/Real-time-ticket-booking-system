@@ -1,0 +1,30 @@
+# Keeps the Docker build context small and, more importantly, keeps
+# secrets and local state OUT of image layers. `.env` is excluded on
+# purpose -- env vars reach containers via docker-compose.yml's
+# `environment`/`env_file`, never baked into an image at build time.
+
+node_modules
+**/node_modules
+**/dist
+**/.next
+**/.turbo
+**/coverage
+.git
+.env
+.env.*
+!.env.example
+*.log
+.vscode
+.idea
+tests/load/output
+docs
+README.md
+
+# Terraform: provider binaries are hundreds of MB, and state/tfvars hold
+# real secrets (DB password, Redis key) -- neither belongs in a build
+# context, even for an intermediate stage.
+**/.terraform
+**/*.tfstate
+**/*.tfstate.*
+**/terraform.tfvars
+**/*.auto.tfvars

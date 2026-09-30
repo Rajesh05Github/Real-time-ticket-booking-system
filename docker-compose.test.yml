@@ -1,0 +1,55 @@
+# Phase 17: a SEPARATE, disposable Postgres + Redis pair for real
+# integration tests -- deliberately not the same containers docker-compose.yml
+# runs for local dev. Reusing the dev stack would mean an integration test
+# run could corrupt data you're actively looking at in `psql`/`redis-cli`
+# while developing, and a test that leaves the database in a weird state
+# (a crashed test mid-assertion) would poison the NEXT dev session too.
+#
+# No named volumes here on purpose: `docker compose -f docker-compose.test.yml
+# down -v` should always come back to a byte-for-byte clean slate, which is
+# what makes a flaky "worked on my machine, fails in CI" divergence
+# something this setup can't produce -- there's no leftover state a volume
+# could be carrying between runs.
+#
+# See docs/testing.md for the full unit-vs-integration split and how to run
+# these.
+
+name: flashsale-test
+
+services:
+  postgres-test:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: flashsale
+      POSTGRES_PASSWORD: flashsale
+      POSTGRES_DB: flashsale_test
+    ports:
+      # Host port 5440 -- NOT 5436 (one past the dev stack's 5435), which
+      # was the first choice here and turned out to already have TWO
+      # other local listeners bound to it on this machine (`netstat -ano`
+      # showed two LISTENING processes on 0.0.0.0:5436), silently routing
+      # Prisma's migrate deploy to the WRONG server and surfacing as a
+      # generic P1000 "authentication failed" -- a real port collision
+      # found live, not a hypothetical one. 5440 was confirmed free via
+      # the same netstat check before landing on it. See docs/testing.md.
+      - '5440:5432'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U flashsale -d flashsale_test']
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  redis-test:
+    image: redis:7-alpine
+    # No --appendonly here, unlike docker-compose.yml's dev Redis: an
+    # integration test run's Streams/session/lock state has zero reason to
+    # survive a container restart -- durability is exactly the property
+    # dev/prod Redis needs and disposable test Redis doesn't.
+    ports:
+      # Host port 6381 -- one past the dev stack's remapped 6380.
+      - '6381:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 2s
+      timeout: 2s
+      retries: 15

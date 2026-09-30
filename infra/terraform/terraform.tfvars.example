@@ -1,0 +1,27 @@
+# Copy to terraform.tfvars and fill in before `terraform apply`.
+# terraform.tfvars is gitignored the same way .env is -- see
+# docs/aws-deployment.md.
+
+aws_region  = "us-east-1"
+environment = "production"
+
+# Leave as null (or omit) to skip ACM/HTTPS and get an http-only ALB --
+# useful for a quick throwaway test with no domain. See acm.tf.
+domain_name = null
+
+# Set these to whatever your CI pipeline actually pushed to ECR (e.g. a
+# git SHA) -- "latest" is a placeholder, not a real deployment practice
+# (see docs/aws-deployment.md on why IMMUTABLE tags + explicit tags
+# matter here).
+api_image_tag    = "latest"
+worker_image_tag = "latest"
+web_image_tag    = "latest"
+
+api_desired_count    = 2
+worker_desired_count = 2
+
+db_instance_class       = "db.t4g.micro"
+db_allocated_storage_gb = 20
+db_multi_az             = false
+
+redis_node_type = "cache.t4g.micro"

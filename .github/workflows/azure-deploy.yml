@@ -1,0 +1,214 @@
+# CI + continuous deployment to Azure Container Apps.
+#
+#   every push / PR : lint, typecheck, unit tests, integration tests
+#   push to main    : + build 4 images -> ACR, run DB migrations as a
+#                     Container Apps job, roll out api/worker/web/gateway,
+#                     smoke-test the public URL
+#
+# Setup (docs/azure-deployment.md, "CI/CD"): an Entra app registration with
+# a GitHub OIDC federated credential (no stored cloud passwords), its
+# object id passed to Terraform as ci_principal_object_id, and these
+# repository VARIABLES (not secrets -- none of them is sensitive):
+#   AZURE_CLIENT_ID  AZURE_TENANT_ID  AZURE_SUBSCRIPTION_ID
+#   AZURE_RESOURCE_GROUP  ACR_NAME  MIGRATE_JOB
+#   CA_API  CA_WORKER  CA_WEB  CA_GATEWAY  PUBLIC_URL
+# All of them except the first three are `terraform output` values.
+
+name: azure-deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.event_name == 'push' && 'deploy-production' || format('ci-{0}', github.ref) }}
+  # Never cancel a deploy mid-rollout (a half-applied migration/rollout is
+  # worse than a queued one); PR runs can be superseded freely.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    # Same disposable Postgres/Redis pair docker-compose.test.yml provides
+    # locally, on the same host ports apps/api/vitest.integration.config.ts
+    # expects.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: flashsale
+          POSTGRES_PASSWORD: flashsale
+          POSTGRES_DB: flashsale_test
+        ports: ['5440:5432']
+        options: >-
+          --health-cmd "pg_isready -U flashsale -d flashsale_test"
+          --health-interval 2s --health-timeout 2s --health-retries 15
+      redis:
+        image: redis:7-alpine
+        ports: ['6381:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s --health-timeout 2s --health-retries 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4 # version comes from package.json's packageManager
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Unit tests
+        run: pnpm test
+
+      - name: Integration tests
+        env:
+          DATABASE_URL: postgresql://flashsale:flashsale@localhost:5440/flashsale_test
+        run: |
+          pnpm --filter @flashsale/database exec prisma migrate deploy
+          pnpm --filter @flashsale/api run test:integration
+
+  build:
+    if: github.event_name != 'pull_request'
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    permissions:
+      contents: read
+      id-token: write # GitHub OIDC -> Entra ID, no stored credentials
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - app: api
+            dockerfile: infra/docker/api.Dockerfile
+            context: .
+          - app: worker
+            dockerfile: infra/docker/worker.Dockerfile
+            context: .
+          - app: web
+            dockerfile: infra/docker/web.Dockerfile
+            context: .
+          - app: gateway
+            dockerfile: infra/azure/gateway/Dockerfile
+            context: infra/azure/gateway
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Log in to ACR
+        run: az acr login --name "${{ vars.ACR_NAME }}"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ vars.ACR_NAME }}.azurecr.io/flashsale-${{ matrix.app }}:${{ github.sha }}
+          # Same-origin deployment: the browser bundle uses relative /api
+          # URLs through the gateway (apps/web/src/lib/api/config.ts).
+          build-args: |
+            NEXT_PUBLIC_API_URL=
+          cache-from: type=gha,scope=${{ matrix.app }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.app }}
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+      REGISTRY: ${{ vars.ACR_NAME }}.azurecr.io
+      TAG: ${{ github.sha }}
+
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install the containerapp CLI extension
+        run: az extension add --name containerapp --upgrade --only-show-errors
+
+      # Migrations run BEFORE any new code is rolled out, from inside the
+      # VNet (Postgres has no public endpoint). Every migration in this
+      # repo is additive/backward compatible, so the still-running
+      # previous revision keeps working against the migrated schema.
+      - name: Run database migrations
+        run: |
+          set -eu
+          JOB="${{ vars.MIGRATE_JOB }}"
+          az containerapp job update -g "$RG" -n "$JOB" --image "$REGISTRY/flashsale-api:$TAG" --only-show-errors -o none
+          EXECUTION=$(az containerapp job start -g "$RG" -n "$JOB" --query name -o tsv)
+          echo "migration execution: $EXECUTION"
+          for _ in $(seq 1 60); do
+            STATUS=$(az containerapp job execution show -g "$RG" -n "$JOB" --job-execution-name "$EXECUTION" --query properties.status -o tsv)
+            echo "status: $STATUS"
+            case "$STATUS" in
+              Succeeded) exit 0 ;;
+              Failed|Stopped|Degraded)
+                echo "::error::migration job $EXECUTION ended with $STATUS -- see its logs in Log Analytics (ContainerAppConsoleLogs_CL)"
+                exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "::error::migration job did not finish within 10 minutes"
+          exit 1
+
+      # Worker first (it only consumes), then api, then web, then gateway.
+      - name: Roll out new revisions
+        run: |
+          set -eu
+          for pair in "worker:${{ vars.CA_WORKER }}" "api:${{ vars.CA_API }}" "web:${{ vars.CA_WEB }}" "gateway:${{ vars.CA_GATEWAY }}"; do
+            APP_IMAGE="${pair%%:*}"; APP_NAME="${pair#*:}"
+            echo ">> $APP_NAME <- flashsale-$APP_IMAGE:$TAG"
+            az containerapp update -g "$RG" -n "$APP_NAME" --image "$REGISTRY/flashsale-$APP_IMAGE:$TAG" --only-show-errors -o none
+          done
+
+      - name: Smoke test
+        run: |
+          set -eu
+          URL="${{ vars.PUBLIC_URL }}"
+          for _ in $(seq 1 30); do
+            if curl -fsS "$URL/health" && curl -fsS -o /dev/null "$URL/api/v1/events"; then
+              echo; echo "healthy: $URL"; exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::$URL did not become healthy after the rollout"
+          exit 1

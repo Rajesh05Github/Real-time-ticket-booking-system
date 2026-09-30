@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "display": "FLASHSALE base",
+  "compilerOptions": {
+    /* Language target. Node 22+ supports all of ES2023. */
+    "target": "ES2023",
+    "lib": ["ES2023"],
+
+    /* --- STRICTNESS ---
+     * Every one of these catches a class of bug at compile time.
+     * `strict` alone is not enough; the four below are the ones that
+     * actually matter in a codebase that touches untrusted input. */
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitReturns": true,
+    "allowUnreachableCode": false,
+    "allowUnusedLabels": false,
+    "forceConsistentCasingInFileNames": true,
+
+    /* Unused code is a smell; surface it in the editor, not in review. */
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+
+    /* --- INTEROP --- */
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+
+    /* --- EMIT --- */
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "removeComments": false,
+    "importHelpers": false,
+    "newLine": "lf",
+    "pretty": true
+  },
+  "exclude": ["node_modules", "dist", ".next", ".turbo", "coverage"]
+}
